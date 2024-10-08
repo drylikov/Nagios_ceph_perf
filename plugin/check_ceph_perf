@@ -1,0 +1,543 @@
+#!/usr/bin/python
+#
+# check_ceph_perf
+#
+# Dumps Ceph I/O, osd count, pg states, and storage in a nagios3-friendly way.
+#
+# This file is part of nagios-ceph-perf
+#
+# nagios-ceph-perf is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# nagios-ceph-perf is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Foobar.  If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import print_function
+
+import os
+import subprocess
+import re
+import json
+import pprint
+import sys
+import argparse
+import time
+
+STATUS_OK = 0
+STATUS_WARNING = 1
+STATUS_ERROR = 2
+STATUS_UNKNOWN = 3
+
+CEPH_COMMAND = "/usr/bin/ceph"
+
+__version__ = '1.0.3'
+
+
+#We need checks for both of these to determine if the data in is in bytes already.
+def toBytesI(value, ident):
+	a = { 'k':1, 'K':1, 'm':2, 'M':2, 'g':3, 'G':3, 't':4, 'T':4, 'p':5, 'P':5, 'e':6, 'E':6 }
+	r = value
+	for i in range(a[ident]):
+		r = r * 1024
+	return r
+
+def bToXB(value, ident):
+	a = { 'k':1, 'K':1, 'm':2, 'M':2, 'g':3, 'G':3, 't':4, 'T':4, 'p':5, 'P':5, 'e':6, 'E':6 }
+	r = float(value)
+	for i in range(a[ident]):
+		r = r / 1024
+	return r
+
+# getProc
+#
+# @proc, list
+# @ret, iterator type
+#
+# Popens the process (Waits for completion), then returns an iterator
+#  containing all output.
+def getProc(proc):
+	process = subprocess.Popen(proc, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+	return iter(process.stdout.readline, b'')
+
+# getProcL
+#
+# @proc, list
+# @ret, list
+#
+# calls getProc and converts it to a list
+def getProcL(proc):
+	out = []
+	#I can totally just call return list(getProc(proc)) can't I?
+	for line in getProc(proc):
+		out.append(line)
+	return out
+
+class CephStatusParser:
+	def __init__(self):
+		# JSON 
+		self.json_ = None					#Raw complete json
+
+		self.mons = {}
+
+		self.generic = None					#Election and fsid
+		#health related information
+		self.health_generic = None			#Generic health data
+		self.health_mon_tree = None 		#This data needs to merge with monmap_tree data.
+											#It will also contain perf data that needs to be
+											#split up into a handful of dict's
+
+		#mdsmap related information
+		self.mdsmap_generic = None			#Generic mdsmap data
+		self.mdsmap_perf = None				#perf-related mdsmap data
+
+		#monmap related information
+		self.monmap_generic = None 			#Generic monmap data (epoch, fsid, modified,)
+		# self.monmap_tree = None 			#monmap tree
+
+		#osd related information.
+		self.osdmap_generic = None			#Generic osd state information (epoch, full, nearfull)
+		self.osdmap_perf = None 			#osdmap perf data (num_osds, num_in_osds, num_up_osds)
+		self.osdmap_perf_rm_pgs = None		#osdmap remapped pg's (num_remapped_pgs)
+
+		#pg related information.
+		self.pgmap_generic = None 			#Generic pg state information
+		self.pgmap_perf_pg_states = None	#pgmap pg's by state
+		self.pgmap_perf_storage = None		#pgmap storage information
+		self.pgmap_perf_io = None			#pgmap perf data.
+
+		self.pgmap_perf_pg_states = {
+			"creating":0,
+			"active":0,
+			"clean":0,
+			"down":0,
+			"replay":0,
+			"splitting":0,
+			"scrubbing":0,
+			"degraded":0,
+			"inconsistent":0,
+			"peering":0,
+			"repair":0,
+			"recovering":0,
+			"backfill":0,
+			"incomplete":0,
+			"stale":0,
+			"remapped":0,
+			"undersized":0,
+			"peered":0,
+		}
+
+	def generate(self, linesIn):
+		for line in linesIn:
+			if len(line.rstrip()) == 0:
+				continue
+			self.json_ = json.loads(line) #with this; we only populate the last valid entry.
+			break
+
+		self.generic = {}
+
+		if "fsid" not in self.json_:
+			#Spit out error
+			sys.exit(STATUS_UNKNOWN)
+		self.generic['fsid'] = self.json_['fsid']
+
+		try:
+			mon_health_tree = self.json_['health']['timechecks']['mons']
+		except:
+			print("Unable to acquire health timechecks information")
+			sys.exit(STATUS_UNKNOWN)
+
+		mon_health_services = None
+
+		try:
+			for item in self.json_['health']['health']['health_services']:
+				if 'mons' in item:
+					mon_health_services = item['mons']
+		except:
+			print("Unable to acquire health services information")
+			sys.exit(STATUS_UNKNOWN)
+
+		try:
+			self.generic['status'] = self.json_['health']['overall_status']
+			self.generic['epoch'] = self.json_['health']['timechecks']['epoch']
+			self.generic['round'] = self.json_['health']['timechecks']['round']
+			self.generic['quorum'] = self.json_['quorum']
+
+		except:
+			print("Unable to acquire health information.")
+			sys.exit(STATUS_UNKNOWN)
+
+		try:
+			for mons in self.json_['monmap']['mons']:
+				self.mons[mons['name']] = mons
+				raw_addr_info = self.mons[mons['name']]['addr'].split(":")
+				self.mons[mons['name']]['addr'] = raw_addr_info[0]
+				self.mons[mons['name']]['port'] = raw_addr_info[1].split("/")[0]
+
+
+		except:
+			print("Unable to populate monmap data.")
+			sys.exit(STATUS_UNKNOWN)
+
+		try:
+			self.osdmap_perf = {}
+			for idx in ['num_in_osds', 'num_osds', 'num_up_osds']:
+				self.osdmap_perf[idx] = self.json_['osdmap']['osdmap'][idx]
+			self.osdmap_generic = {}
+			for idx in ['epoch', 'full', 'nearfull']:
+				self.osdmap_generic[idx] = self.json_['osdmap']['osdmap'][idx]
+			self.osdmap_perf_rm_pgs = self.json_['osdmap']['osdmap']['num_remapped_pgs']
+		except:
+			print("Unable to populate osdmap data.")
+			sys.exit(STATUS_UNKNOWN)
+
+		try:
+			self.generic['pg_version'] = self.json_['pgmap']['version']
+			self.pgmap_perf_io = {}
+			for idx in [ 'read_bytes_sec', 'write_bytes_sec', 'op_per_sec']: #
+				try:
+					self.pgmap_perf_io[idx] = self.json_['pgmap'][idx]
+				except:
+					self.pgmap_perf_io[idx] = 0
+			self.pgmap_perf_storage = {}
+			for idx in [ 'bytes_avail', 'bytes_total', 'bytes_used', 'data_bytes' ]:
+				try:
+					self.pgmap_perf_storage[idx] = self.json_['pgmap'][idx]
+				except:
+					self.pgmap_perf_storage[idx] = 0
+			#self.pgmap_perf_pg_states = {}
+			for arrV in self.json_['pgmap']['pgs_by_state']:
+				#This is an incredibly slow way of doing shit.
+				for state in self.pgmap_perf_pg_states:
+					if state in arrV['state_name']:
+						self.pgmap_perf_pg_states[state] += int(arrV['count'])
+
+		except:
+			print("Unable to populate placement group data.")
+			sys.exit(STATUS_UNKNOWN)
+
+		for item in mon_health_tree:
+			for entry in self.mons:
+				if entry == item['name']:
+					self.mons[entry]['health'] = item['health']
+					self.mons[entry]['perf_generic'] = {}
+					for key in ['latency', 'skew']:
+						self.mons[entry]['perf_generic'][key] = item[key]
+		for item in mon_health_services:
+			for entry in self.mons:
+				if entry == item['name']:
+					self.mons[entry]['perf_storage'] = {}
+					self.mons[entry]['perf_store_stats'] = {}
+					self.mons[entry]['last_updated'] = item['last_updated']
+					for key in ['kb_avail', 'kb_total', 'kb_used']:
+						self.mons[entry]['perf_storage'][key] = item[key]
+					for key in ['bytes_log', 'bytes_misc', 'bytes_sst', 'bytes_total']:
+						self.mons[entry]['perf_store_stats'][key] = item['store_stats'][key]
+
+		#NEED TO ADD MDSMAP DATA HERE
+
+	def keypair_to_str(self,dict,key):
+		return "%s=%s" % (str(key), str(dict[key]))
+	kpts = keypair_to_str
+
+	def get_generic(self,level):
+		out = "%s " % str(self.generic['status'])
+		if level > 0:
+			out+="quorum=[" 
+			#Don't want spaces. forced to do this I think.
+			for val in self.generic['quorum']:
+				out+="%s," % str(val)
+			out=out[:-1]
+			out+="]; "
+		if level > 1:
+			out+="%s;" % self.kpts(self.generic, 'epoch')
+		if level > 2:
+			out+="%s;" % self.kpts(self.generic, 'fsid')
+		if level > 3:
+			out+="%s;" % self.kpts(self.generic, 'round')
+
+		if level > 0:
+			out+=" "
+		return out
+
+	def get_mon_generic(self, level):
+		out = "mons=["
+		for mon in self.mons:
+			out+="%s=" % mon
+			out+="%s" % str(self.mons[mon]['rank'])
+
+			#We need to add additionals for split-up addr here
+			# Actually, addr is pretty worthless to me; but I imagine it's good for other folks.
+			if level > 0:
+				out+=",%s" % str(self.mons[mon]['addr'])
+			if level > 1:
+				out+=",%s" % str(self.mons[mon]['last_updated'].replace(" ", "_"))
+			out+=", "
+		out=out[:-2]
+		out+="]; "
+
+		return out
+
+	#These next 3 methods could be combined pretty easily.
+	#If a mon is provided; it'll return only delimited values, without the mon's name.
+	def get_mon_perf_generic(self,lmon=None):
+		def mon_key_stat(monIn):
+			lout = ""
+			for key in [ 'latency', 'skew' ]:
+				lout += "mperfg_%s_%s=%f " % (key, str(monIn['name']), monIn['perf_generic'][key])
+			return lout
+
+		out = ""
+		for mon in self.mons:
+			out+=mon_key_stat(self.mons[mon])
+		return out
+
+	def get_mon_perf_storage(self, lmon=None):
+		def mon_key_stat(monIn):
+			lout = ""
+			for key in [ 'kb_avail', 'kb_total', 'kb_used' ]:
+				lout += "mperfst_%s_%s=%d " % (key.replace("kb_",""), str(monIn['name']), monIn['perf_storage'][key])
+			return lout
+
+		out = ""
+		for mon in self.mons:
+			out+=mon_key_stat(self.mons[mon])
+		return out
+
+	def get_mon_perf_store_stats(self, lmon=None):
+		def mon_key_stat(monIn):
+			lout = ""
+			for key in [ 'bytes_log', 'bytes_misc', 'bytes_sst', 'bytes_total' ]:
+				lout += "mperfs_%s_%s=%d " % (key.replace("bytes_",""), str(monIn['name']), monIn['perf_store_stats'][key])
+			return lout
+
+		out = ""
+		for mon in self.mons:
+			out+=mon_key_stat(self.mons[mon])
+		return out
+
+	def get_osd_generic(self, level):
+		out = "osd=%s,%s" % (str(self.osdmap_generic['nearfull']), str(self.osdmap_generic['full']))
+		if level > 0:
+			out+=",%s" % str(self.osdmap_generic['epoch'])
+		if level > 1:
+			out+=",%s" % str(self.osdmap_perf['num_osds'])
+		out+="; "
+		return out
+
+	def get_osd_perf(self):
+		out = ""
+		for key in [ 'num_osds', 'num_up_osds', 'num_in_osds']:
+			out+="osdp_%s=%s " % (key, str(self.osdmap_perf[key]))
+		out=out[:-1]
+		out+=" "
+		return out
+
+	def get_pg_perf_storage(self):
+		out = ""
+		for key in [ 'bytes_avail', 'bytes_total', 'bytes_used' ]:
+			#bToXB
+			# fVal = float(self.pgmap_perf_storage[key])
+			# out+="pg_%s=%.4f " % (key, bToXB(fVal, 'M'))
+			out+="pg_%s=%d " % (key, int(self.pgmap_perf_storage[key]))
+		out=out[:-1]
+		out+=" "
+		return out;
+
+	def get_pg_perf_states(self):
+		out = ""
+		for key in self.pgmap_perf_pg_states:
+			out+="pgps_%s=%d " % (str(key),int(self.pgmap_perf_pg_states[key]))
+		return out 
+
+	def get_pg_perf_throughput(self):
+		out = ""
+		for key in [ 'read_bytes_sec', 'write_bytes_sec' ]:
+			out+="pg_perf_%s=%s " % (key, self.pgmap_perf_io[key])
+		out=out[:-1]
+		out+=" "
+		return out;
+
+	def get_pg_perf_ops(self):
+		out = "pg_perf_ops=%s " % str(self.pgmap_perf_io['op_per_sec'])
+		return out;
+
+	#Quick calls this.
+	def get_simple_perf(self):
+		out = self.get_generic(0)
+		out += "| "
+		out += self.get_pg_perf_storage()
+		out += self.get_pg_perf_throughput()
+		out += self.get_pg_perf_ops()
+		out += self.get_osd_perf()
+		out += self.get_pg_perf_states()
+		return out
+
+	def get_status(self):
+		if self.generic['status'].startswith("HEALTH_OK"):
+			return STATUS_OK
+		elif self.generic['status'].startswith("HEALTH_WARN"):
+			return STATUS_WARNING
+		elif self.generic['status'].startswith("HEALTH_ERROR"):
+			return STATUS_ERROR
+		else:
+			return STATUS_UNKNOWN
+
+	def add(self, other):
+		#The only things that add and divide will modify are the ops, b/s read and b/s write
+		for key in [ 'read_bytes_sec', 'write_bytes_sec', 'op_per_sec' ]:
+			self.pgmap_perf_io[key] += other.pgmap_perf_io[key]
+
+	def average(self, samples):
+		#The only things that add and divide will modify are the ops, b/s read and b/s write
+		for key in [ 'read_bytes_sec', 'write_bytes_sec', 'op_per_sec' ]:
+			self.pgmap_perf_io[key] = int(self.pgmap_perf_io[key] / samples)
+
+
+class CephProcHandler:
+	def __init__(self, fpath):
+		self.path = None
+
+		if os.path.isfile(fpath) and os.access(fpath, os.X_OK):
+			self.path = fpath
+
+		self.cephexec = fpath
+		self.args = []
+		self.data = None
+
+	def addArg(self, arg, val):
+		if not arg:
+			return 0
+
+		self.args.append(arg)
+
+		if val:
+			self.args.append(val)
+
+	def get(self):
+		outgen = [self.cephexec, "status", "-f", "json"]
+		if (self.args):
+			for larg in self.args:
+				outgen.append(larg)
+
+		self.data = getProcL(outgen)
+
+		return self.data
+
+	def __str__(self):
+		out = ""
+		for line in self.data:
+			out += "%s\n" % line
+		return out
+
+	__repr__ = __str__
+
+
+if __name__ == "__main__":
+	parser = argparse.ArgumentParser(description="'ceph perf' nagios plugin.")
+
+	parser.add_argument('-q', '--quick', help='quick output configuration (generic + | + pg_perf_storage + pg_perf_througput + pg_perf_ops + osd_perf), one sample unless defined elsewhere.', action='store_true')
+	parser.add_argument('-i', '--id', help='ceph client id')
+	parser.add_argument('-k', '--keyring', help='ceph client keyring file')
+	parser.add_argument('-e', '--exec', help='ceph executable path [%s]' % CEPH_COMMAND)
+	parser.add_argument('-s', '--samples', help='samples to take before providing output', default=0, type=int)
+	parser.add_argument('-d', '--sample_delay', help='time between taking each sample in seconds', default=1, type=int)
+
+	parser.add_argument('--generic_level', help='sets verbosity of output for the generic print (Non-perf).  0 shows status, 1 shows quorum, 2 shows epoch, 3 shows fsid, 4 shows round.', default=0, type=int)
+	parser.add_argument('--mon_generic', help='render mon generic data (host, ip, ranking, updated)', action='store_true')
+	parser.add_argument('--mon_generic_perf', help='render mon perf data (latency, skew)', action='store_true')
+	parser.add_argument('--mon_storage_perf', help='render mon perf data (kb_avail,_total,_used)', action='store_true')
+	parser.add_argument('--mon_store_stats_perf', help='render mon perf data (bytes_log,_misc,_sst,_total)', action='store_true')
+
+	parser.add_argument('--osd_generic', help='render generic osd data (nearfull, full), defaults to 0', action='store_true')
+	parser.add_argument('--osd_perf', help='render osd perf data (num_osds, _up_osds,_in_osds', action='store_true')
+
+	parser.add_argument('--pg_perf_storage', help='render pg perf data (bytes_avail, _total, _used)', action='store_true')
+	parser.add_argument('--pg_perf_states', help='render pg perf states (Renders all possible states [large amount of data])', action='store_true')
+	parser.add_argument('--pg_perf_throughput', help='render pg perf throughput (write/read bytes per second)', action='store_true')
+	parser.add_argument('--pg_perf_ops', help='render pg perf ops (ops)', action='store_true')
+
+	args = parser.parse_args()
+
+	cstatusp = CephStatusParser()
+	cprochandler = CephProcHandler("/usr/bin/ceph") #Why aren't we using the exec arg?
+
+	if args.keyring and not os.path.exists(args.keyring):
+		print("ERROR: keyring file '%s' doesn't exist" % args.keyring)
+		sys.exit(STATUS_UNKNOWN)
+
+	if (args.id):
+		cprochandler.addArg('--id', args.id)
+
+	if (args.keyring):
+		cprochandler.addArg('--keyring', args.keyring)
+
+	cstatusp.generate(cprochandler.get())
+
+	if (args.quick):
+		print(cstatusp.get_simple_perf())
+		sys.exit(cstatusp.get_status())
+
+	if (args.samples > 0):
+		if args.sample_delay <= 0: #If we get a garbage sample request delay, reset it.
+			args.sample_delay = 1
+		for i in range(0, args.samples - 1):
+			sstatusp = None
+			sstatusp = CephStatusParser()
+			cprochandler = CephProcHandler("/usr/bin/ceph")
+			sstatusp.generate(cprochandler.get())
+			sstatusp.add(cstatusp)
+			time.sleep(args.sample_delay)
+			cstatusp = sstatusp #We want the last entry's status, so copy it over.
+
+		cstatusp.average(int(args.samples))
+
+
+	out = ""
+
+	#No matter what, this gets called.
+	if (args.generic_level < 0): #Make sure we don't get ltzeros.
+		args.generic_level = 0
+
+	out += cstatusp.get_generic(args.generic_level)
+
+	#Non-perf data.
+	if (args.mon_generic):
+		out += cstatusp.get_mon_generic(0) #We want the level to be modified too.
+	if (args.osd_generic):
+		out += cstatusp.get_osd_generic()
+
+	#If any perf data was requested, add the requred |
+	for arg in vars(args):
+		if 'perf' in arg and (getattr(args, arg) == True):
+			out += "| "
+
+	#Perf data.
+	if (args.mon_generic_perf):
+		out += cstatusp.get_mon_perf_generic()
+	if (args.mon_storage_perf):
+		out += cstatusp.get_mon_perf_storage()
+	if (args.mon_store_stats_perf):
+		out += cstatusp.get_mon_perf_store_stats()
+
+	if (args.osd_perf):
+		out += cstatusp.get_osd_perf()
+
+	if (args.pg_perf_storage):
+		out += cstatusp.get_pg_perf_storage()
+	if (args.pg_perf_throughput):
+		out += cstatusp.get_pg_perf_throughput()
+	if (args.pg_perf_ops):
+		out += cstatusp.get_pg_perf_ops()
+	if (args.pg_perf_states):
+		out += cstatusp.get_pg_perf_states()
+
+	print(out)
+
+	sys.exit(cstatusp.get_status())
