@@ -1,4 +1,4 @@
-# Hagios ceph perf.
+# Nagios ceph perf.
 Nagios Plugin and PNP4Nagios Template for Acquiring Ceph Perf Data.
 
 # why this and not the ceph distributed one?
